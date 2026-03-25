@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pitch Climber</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d1117; overflow: hidden; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+#overlay {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 10; color: #e6edf3; text-align: center;
+  background: rgba(13, 17, 23, 0.92);
+}
+#overlay h1 { font-size: 3rem; margin-bottom: 0.5rem; color: #58a6ff; }
+#overlay h2 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #8b949e; font-weight: normal; }
+#overlay p { font-size: 1rem; color: #8b949e; margin: 0.3rem 0; max-width: 500px; }
+#overlay button {
+  margin-top: 1.5rem; padding: 14px 40px; font-size: 1.2rem;
+  background: #238636; color: #fff; border: none; border-radius: 6px;
+  cursor: pointer; font-family: inherit;
+}
+#overlay button:hover { background: #2ea043; }
+#calibration-bar {
+  width: 300px; height: 30px; background: #161b22; border: 1px solid #30363d;
+  border-radius: 4px; margin: 1rem 0; overflow: hidden; position: relative;
+}
+#calibration-fill {
+  height: 100%; background: #58a6ff; width: 0%; transition: width 0.08s;
+}
+#pitch-readout { font-size: 1.6rem; color: #58a6ff; min-height: 2rem; }
+#countdown {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  font-size: 8rem; color: #58a6ff; z-index: 20; display: none;
+  text-shadow: 0 0 40px rgba(88,166,255,0.5);
+}
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="overlay">
+  <div id="screen-title">
+    <h1>PITCH CLIMBER</h1>
+    <h2>Use your voice to climb!</h2>
+    <p>Sing higher to climb. Hold target notes on ledges to checkpoint.</p>
+    <p>Warning: falsetto will be required. Dignity is optional.</p>
+    <button id="btn-start">Start Microphone</button>
+    <p id="mic-error" class="hidden" style="color:#f85149;margin-top:1rem;"></p>
+  </div>
+  <div id="screen-calibrate" class="hidden">
+    <h2>Microphone Calibration</h2>
+    <p>Say "Ahhh" or hum a note to test your mic.</p>
+    <div id="calibration-bar"><div id="calibration-fill"></div></div>
+    <div id="pitch-readout">Waiting for sound...</div>
+    <p id="cal-status" style="color:#3fb950;min-height:1.5rem;"></p>
+    <button id="btn-play">Ready to Climb!</button>
+  </div>
+  <div id="screen-gameover" class="hidden">
+    <h1 id="gameover-title">GAME OVER</h1>
+    <p id="gameover-msg"></p>
+    <p id="gameover-score" style="font-size:1.4rem;color:#58a6ff;margin-top:0.5rem;"></p>
+    <button id="btn-retry">Try Again</button>
+  </div>
+</div>
+<div id="countdown"></div>
+
+<script>
+// ============================================================
+// PITCH CLIMBER - A voice-controlled climbing game
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// UI elements
+const overlay = document.getElementById('overlay');
+const screenTitle = document.getElementById('screen-title');
+const screenCalibrate = document.getElementById('screen-calibrate');
+const screenGameover = document.getElementById('screen-gameover');
+const btnStart = document.getElementById('btn-start');
+const btnPlay = document.getElementById('btn-play');
+const btnRetry = document.getElementById('btn-retry');
+const micError = document.getElementById('mic-error');
+const calFill = document.getElementById('calibration-fill');
+const pitchReadout = document.getElementById('pitch-readout');
+const calStatus = document.getElementById('cal-status');
+const countdownEl = document.getElementById('countdown');
+const gameoverTitle = document.getElementById('gameover-title');
+const gameoverMsg = document.getElementById('gameover-msg');
+const gameoverScore = document.getElementById('gameover-score');
+
+// Audio
+let audioCtx, analyser, micStream;
+
+// Game state
+const G = {
+  state: 'title', // title, calibrate, countdown, playing, gameover, win
+  pitch: -1,
+  smoothPitch: -1,
+  playerY: 0,       // world Y (pixels from bottom)
+  targetY: 0,
+  cameraY: 0,
+  height: 0,        // meters
+  score: 0,
+  startTime: 0,
+  level: 0,         // 0-indexed, 3 levels total
+  ledges: [],
+  currentLedge: -1, // index of highest reached ledge
+  holdTimer: 0,
+  holdRequired: 2.0,
+  stars: [],
+  birds: [],
+  rocks: [],
+  windTimer: 0,
+  windShake: 0,
+  particles: [],
+  waveform: new Float32Array(2048),
+  lastFrame: 0,
+  calDetections: 0,
+};
+
+// Constants
+const GRAVITY = 40;         // pixels/sec fall when silent
+const LERP_SPEED = 4;       // how fast char follows target
+const CLIFF_WIDTH = 120;
+const LEDGE_WIDTH = 100;
+const LEDGE_HEIGHT = 12;
+const CHAR_SIZE = 24;
+const METERS_PER_PIXEL = 0.05;
+const LEVEL_HEIGHT = 3000;  // pixels per level
+
+// Note names
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+function freqToNote(freq) {
+  if (freq <= 0) return '';
+  const semitone = 12 * Math.log2(freq / 440);
+  const midi = Math.round(semitone) + 69;
+  const name = NOTE_NAMES[((midi % 12) + 12) % 12];
+  const octave = Math.floor(midi / 12) - 1;
+  return name + octave;
+}
+
+// ============================================================
+// PITCH DETECTION (Autocorrelation)
+// ============================================================
+function detectPitch(analyser) {
+  const bufLen = analyser.fftSize;
+  const buf = new Float32Array(bufLen);
+  analyser.getFloatTimeDomainData(buf);
+
+  // RMS check
+  let rms = 0;
+  for (let i = 0; i < bufLen; i++) rms += buf[i] * buf[i];
+  rms = Math.sqrt(rms / bufLen);
+  if (rms < 0.01) return -1;
+
+  // Trim silence from edges
+  let start = 0, end = bufLen - 1;
+  const threshold = 0.2;
+  while (start < bufLen && Math.abs(buf[start]) < threshold) start++;
+  while (end > start && Math.abs(buf[end]) < threshold) end--;
+  if (end - start < 100) return -1;
+
+  const trimmed = buf.slice(start, end + 1);
+  const len = trimmed.length;
+
+  // Autocorrelation
+  const corr = new Float32Array(len);
+  for (let lag = 0; lag < len; lag++) {
+    let sum = 0;
+    for (let i = 0; i < len - lag; i++) {
+      sum += trimmed[i] * trimmed[i + lag];
+    }
+    corr[lag] = sum;
+  }
+
+  // Find first dip then first peak
+  let d = 0;
+  while (d < len - 1 && corr[d] > corr[d + 1]) d++;
+
+  let maxVal = -1, maxPos = -1;
+  for (let i = d; i < len - 1; i++) {
+    if (corr[i] > maxVal) {
+      maxVal = corr[i];
+      maxPos = i;
+    }
+  }
+
+  if (maxPos === -1 || maxVal < 0.01) return -1;
+
+  // Parabolic interpolation for sub-sample accuracy
+  let prev = corr[maxPos - 1] || 0;
+  let next = corr[maxPos + 1] || 0;
+  let shift = (prev - next) / (2 * (prev - 2 * maxVal + next));
+  if (isNaN(shift) || Math.abs(shift) > 1) shift = 0;
+
+  const period = maxPos + shift;
+  const sampleRate = audioCtx.sampleRate;
+  const freq = sampleRate / period;
+
+  if (freq < 50 || freq > 1500) return -1;
+  return freq;
+}
+
+// ============================================================
+// AUDIO SETUP
+// ============================================================
+async function initAudio() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.8;
+    source.connect(analyser);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Sound effects via oscillator
+function playTone(freq, duration, type, volume) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'sine';
+  osc.frequency.value = freq;
+  gain.gain.value = volume || 0.15;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playChime() {
+  playTone(523, 0.15, 'sine', 0.12);
+  setTimeout(() => playTone(659, 0.15, 'sine', 0.12), 100);
+  setTimeout(() => playTone(784, 0.3, 'sine', 0.12), 200);
+}
+
+function playFanfare() {
+  playTone(523, 0.2, 'square', 0.08);
+  setTimeout(() => playTone(659, 0.2, 'square', 0.08), 150);
+  setTimeout(() => playTone(784, 0.2, 'square', 0.08), 300);
+  setTimeout(() => playTone(1047, 0.5, 'square', 0.1), 450);
+}
+
+function playFall() {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.value = 400;
+  osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.6);
+  gain.gain.value = 0.1;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.6);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.7);
+}
+
+function playCrash() {
+  const bufSize = audioCtx.sampleRate * 0.4;
+  const noiseBuf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuf;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.2;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+  src.connect(gain);
+  gain.connect(audioCtx.destination);
+  src.start();
+}
+
+// ============================================================
+// LEVEL GENERATION
+// ============================================================
+function generateLedges() {
+  G.ledges = [];
+  const levelDefs = [
+    { pitches: [200, 250, 300, 350, 400], tolerance: 50, label: 'Level 1 - Low Notes' },
+    { pitches: [300, 370, 440, 520, 590], tolerance: 30, label: 'Level 2 - Mid Notes' },
+    { pitches: [440, 540, 640, 740, 850], tolerance: 25, label: 'Level 3 - High Notes' },
+  ];
+
+  for (let lv = 0; lv < 3; lv++) {
+    const def = levelDefs[lv];
+    for (let i = 0; i < 5; i++) {
+      const worldY = lv * LEVEL_HEIGHT + (i + 1) * (LEVEL_HEIGHT / 6);
+      G.ledges.push({
+        x: CLIFF_WIDTH,
+        y: worldY,
+        width: LEDGE_WIDTH,
+        targetPitch: def.pitches[i],
+        tolerance: def.tolerance,
+        reached: false,
+        level: lv,
+        index: lv * 5 + i,
+        label: freqToNote(def.pitches[i]) + ' (' + Math.round(def.pitches[i]) + 'Hz)',
+      });
+    }
+  }
+}
+
+function generateStars() {
+  G.stars = [];
+  for (let i = 0; i < 200; i++) {
+    G.stars.push({
+      x: Math.random(),
+      y: Math.random() * LEVEL_HEIGHT * 3.5,
+      size: Math.random() * 2 + 0.5,
+      twinkle: Math.random() * Math.PI * 2,
+    });
+  }
+}
+
+function spawnBird() {
+  G.birds.push({
+    x: canvas.width + 30,
+    y: G.cameraY + Math.random() * canvas.height,
+    speed: 60 + Math.random() * 80,
+    wingPhase: Math.random() * Math.PI * 2,
+  });
+}
+
+function spawnRock(fromY) {
+  G.rocks.push({
+    x: CLIFF_WIDTH + 30 + Math.random() * 60,
+    y: fromY + canvas.height * 0.6,
+    vy: -20 - Math.random() * 40,
+    size: 6 + Math.random() * 8,
+    life: 3,
+  });
+}
+
+// ============================================================
+// GAME LOGIC
+// ============================================================
+function pitchToClimbSpeed(freq) {
+  if (freq <= 0) return -GRAVITY;
+  if (freq < 100) return -GRAVITY * 0.8;
+  if (freq < 200) return 0;
+  if (freq < 400) return 80 + (freq - 200) * 0.4;
+  if (freq < 600) return 160 + (freq - 400) * 0.6;
+  if (freq < 1000) return 280 + (freq - 600) * 0.5;
+  return 480;
+}
+
+function pitchColor(freq, target, tolerance) {
+  if (freq <= 0) return '#484f58';
+  if (target !== undefined) {
+    const diff = Math.abs(freq - target);
+    if (diff <= tolerance) return '#3fb950';
+    if (diff <= tolerance * 2) return '#d29922';
+  }
+  return '#f85149';
+}
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+
+function resetGame() {
+  G.playerY = 50;
+  G.targetY = 50;
+  G.cameraY = 0;
+  G.height = 0;
+  G.score = 0;
+  G.level = 0;
+  G.currentLedge = -1;
+  G.holdTimer = 0;
+  G.birds = [];
+  G.rocks = [];
+  G.particles = [];
+  G.windTimer = 0;
+  G.windShake = 0;
+  G.pitch = -1;
+  G.smoothPitch = -1;
+  generateLedges();
+  generateStars();
+  G.startTime = performance.now();
+}
+
+// ============================================================
+// UPDATE
+// ============================================================
+function update(dt) {
+  if (G.state !== 'playing') return;
+
+  // Detect pitch
+  if (analyser) {
+    G.pitch = detectPitch(analyser);
+    analyser.getFloatTimeDomainData(G.waveform);
+  }
+
+  // Smooth pitch for display
+  if (G.pitch > 0) {
+    G.smoothPitch = G.smoothPitch > 0
+      ? G.smoothPitch * 0.7 + G.pitch * 0.3
+      : G.pitch;
+  } else {
+    G.smoothPitch = -1;
+  }
+
+  // Climb speed
+  const speed = pitchToClimbSpeed(G.pitch);
+  G.targetY += speed * dt;
+  if (G.targetY < 0) G.targetY = 0;
+
+  // Lerp player to target
+  G.playerY += (G.targetY - G.playerY) * LERP_SPEED * dt;
+  if (G.playerY < 0) G.playerY = 0;
+
+  G.height = G.playerY * METERS_PER_PIXEL;
+
+  // Camera follows player
+  const targetCam = G.playerY - canvas.height * 0.4;
+  G.cameraY += (targetCam - G.cameraY) * 2 * dt;
+  if (G.cameraY < 0) G.cameraY = 0;
+
+  // Current level
+  G.level = Math.min(2, Math.floor(G.playerY / LEVEL_HEIGHT));
+
+  // Ledge checking
+  const nextLedgeIdx = G.currentLedge + 1;
+  if (nextLedgeIdx < G.ledges.length) {
+    const ledge = G.ledges[nextLedgeIdx];
+    const playerScreenX = CLIFF_WIDTH + LEDGE_WIDTH / 2;
+    const onLedge = Math.abs(G.playerY - ledge.y) < 40;
+
+    if (onLedge && G.pitch > 0) {
+      const diff = Math.abs(G.pitch - ledge.targetPitch);
+      if (diff <= ledge.tolerance) {
+        G.holdTimer += dt;
+        if (G.holdTimer >= G.holdRequired) {
+          ledge.reached = true;
+          G.currentLedge = nextLedgeIdx;
+          G.holdTimer = 0;
+          G.playerY = ledge.y;
+          G.targetY = ledge.y;
+          playChime();
+
+          // Spawn celebration particles
+          for (let i = 0; i < 20; i++) {
+            G.particles.push({
+              x: CLIFF_WIDTH + LEDGE_WIDTH / 2,
+              y: ledge.y,
+              vx: (Math.random() - 0.5) * 200,
+              vy: Math.random() * 150 + 50,
+              life: 1 + Math.random(),
+              color: ['#3fb950', '#58a6ff', '#d2a8ff', '#f0883e'][Math.floor(Math.random() * 4)],
+              size: 3 + Math.random() * 4,
+            });
+          }
+
+          // Check win
+          if (G.currentLedge >= G.ledges.length - 1) {
+            G.state = 'win';
+            const elapsed = (performance.now() - G.startTime) / 1000;
+            const timeBonus = Math.max(0, Math.round(3000 - elapsed * 5));
+            G.score = Math.round(G.height * 10) + timeBonus;
+            playFanfare();
+            showGameover(true);
+            return;
+          }
+
+          // Level transition
+          if (nextLedgeIdx > 0 && ledge.level !== G.ledges[nextLedgeIdx - 1].level) {
+            playFanfare();
+          }
+        }
+      } else {
+        G.holdTimer = Math.max(0, G.holdTimer - dt * 0.5);
+      }
+    } else {
+      G.holdTimer = Math.max(0, G.holdTimer - dt * 2);
+    }
+  }
+
+  // Super climb particles
+  if (G.pitch > 1000) {
+    for (let i = 0; i < 2; i++) {
+      G.particles.push({
+        x: CLIFF_WIDTH + LEDGE_WIDTH / 2 + (Math.random() - 0.5) * 20,
+        y: G.playerY - 10,
+        vx: (Math.random() - 0.5) * 60,
+        vy: -(Math.random() * 40 + 20),
+        life: 0.5 + Math.random() * 0.3,
+        color: '#d2a8ff',
+        size: 2 + Math.random() * 3,
+      });
+    }
+  }
+
+  // Update particles
+  for (let i = G.particles.length - 1; i >= 0; i--) {
+    const p = G.particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life <= 0) G.particles.splice(i, 1);
+  }
+
+  // Birds
+  G.windTimer -= dt;
+  if (Math.random() < dt * 0.3) spawnBird();
+  for (let i = G.birds.length - 1; i >= 0; i--) {
+    const b = G.birds[i];
+    b.x -= b.speed * dt;
+    b.wingPhase += dt * 8;
+    if (b.x < -40) G.birds.splice(i, 1);
+  }
+
+  // Rocks (spawn near upcoming ledge)
+  if (nextLedgeIdx < G.ledges.length && Math.random() < dt * 0.15) {
+    const ledge = G.ledges[nextLedgeIdx];
+    if (Math.abs(G.playerY - ledge.y) < 300) {
+      spawnRock(ledge.y);
+    }
+  }
+  for (let i = G.rocks.length - 1; i >= 0; i--) {
+    const r = G.rocks[i];
+    r.y += r.vy * dt;
+    r.vy -= 200 * dt;
+    r.life -= dt;
+    if (r.life <= 0) G.rocks.splice(i, 1);
+  }
+
+  // Wind
+  if (G.windTimer <= 0) {
+    G.windTimer = 3 + Math.random() * 5;
+    G.windShake = 0.5 + Math.random() * 0.5;
+  }
+  G.windShake *= (1 - dt * 2);
+
+  // Game over check
+  if (G.playerY < G.cameraY - 100 && G.cameraY > 100) {
+    G.state = 'gameover';
+    playCrash();
+    const elapsed = (performance.now() - G.startTime) / 1000;
+    G.score = Math.round(G.height * 10);
+    showGameover(false);
+  }
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function worldToScreen(wy) {
+  return canvas.height - (wy - G.cameraY);
+}
+
+function render() {
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Background gradient based on altitude
+  const altRatio = Math.min(1, G.cameraY / (LEVEL_HEIGHT * 3));
+  const r = Math.round(13 + altRatio * 20);
+  const g = Math.round(17 - altRatio * 5);
+  const b = Math.round(23 + altRatio * 60);
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.fillRect(0, 0, w, h);
+
+  // Stars
+  const time = performance.now() / 1000;
+  ctx.save();
+  for (const s of G.stars) {
+    const sy = worldToScreen(s.y);
+    if (sy < -10 || sy > h + 10) continue;
+    const sx = s.x * w;
+    const alpha = 0.3 + 0.4 * Math.sin(time * 1.5 + s.twinkle);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#e6edf3';
+    ctx.fillRect(sx, sy, s.size, s.size);
+  }
+  ctx.restore();
+
+  // Musical staff lines (faint)
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  ctx.strokeStyle = '#8b949e';
+  ctx.setLineDash([4, 8]);
+  const staffFreqs = [200, 300, 400, 500, 600, 700, 800, 900, 1000];
+  // Staff lines are decorative, drawn at fixed screen positions
+  for (let i = 0; i < staffFreqs.length; i++) {
+    const y = h - (i + 1) * (h / (staffFreqs.length + 1));
+    ctx.beginPath();
+    ctx.moveTo(CLIFF_WIDTH + LEDGE_WIDTH + 20, y);
+    ctx.lineTo(w - 80, y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Cliff face
+  drawCliff();
+
+  // Ledges
+  for (const ledge of G.ledges) {
+    drawLedge(ledge);
+  }
+
+  // Rocks
+  ctx.fillStyle = '#6e7681';
+  for (const r of G.rocks) {
+    const sx = r.x;
+    const sy = worldToScreen(r.y);
+    if (sy < -20 || sy > h + 20) continue;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Birds
+  for (const b of G.birds) {
+    const sy = worldToScreen(b.y);
+    if (sy < -20 || sy > h + 20) continue;
+    drawBird(b.x, sy, b.wingPhase);
+  }
+
+  // Particles
+  for (const p of G.particles) {
+    const sy = worldToScreen(p.y);
+    if (sy < -20 || sy > h + 20) continue;
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, sy - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // Player character
+  if (G.state === 'playing' || G.state === 'gameover' || G.state === 'win') {
+    drawPlayer();
+  }
+
+  // HUD
+  if (G.state === 'playing') {
+    drawHUD();
+    drawWaveform();
+    drawPitchMeter();
+  }
+}
+
+function drawCliff() {
+  const h = canvas.height;
+
+  // Main cliff body
+  ctx.fillStyle = '#21262d';
+  ctx.fillRect(0, 0, CLIFF_WIDTH, h);
+
+  // Texture blocks
+  const blockSize = 20;
+  const startRow = Math.floor(G.cameraY / blockSize);
+  const endRow = startRow + Math.ceil(h / blockSize) + 1;
+  for (let row = startRow; row <= endRow; row++) {
+    for (let col = 0; col < CLIFF_WIDTH / blockSize; col++) {
+      const seed = (row * 7 + col * 13) % 17;
+      if (seed < 5) {
+        const sy = worldToScreen((row + 1) * blockSize);
+        const shade = 25 + (seed * 4);
+        ctx.fillStyle = `rgb(${shade + 8},${shade + 12},${shade + 18})`;
+        ctx.fillRect(col * blockSize, sy, blockSize - 1, blockSize - 1);
+      }
+    }
+  }
+
+  // Cliff edge highlight
+  ctx.fillStyle = '#30363d';
+  ctx.fillRect(CLIFF_WIDTH - 3, 0, 3, h);
+}
+
+function drawLedge(ledge) {
+  const sy = worldToScreen(ledge.y);
+  if (sy < -60 || sy > canvas.height + 60) return;
+
+  const lx = ledge.x;
+
+  // Ledge platform
+  ctx.fillStyle = ledge.reached ? '#238636' : '#30363d';
+  ctx.fillRect(lx, sy, ledge.width, LEDGE_HEIGHT);
+
+  // Top highlight
+  ctx.fillStyle = ledge.reached ? '#3fb950' : '#484f58';
+  ctx.fillRect(lx, sy, ledge.width, 3);
+
+  // Label
+  ctx.font = '11px Courier New';
+  ctx.fillStyle = ledge.reached ? '#3fb950' : '#8b949e';
+  ctx.textAlign = 'left';
+  ctx.fillText(ledge.label, lx + 4, sy - 6);
+
+  // Hold progress ring (if this is the next target)
+  const nextIdx = G.currentLedge + 1;
+  if (ledge.index === nextIdx && G.holdTimer > 0 && !ledge.reached) {
+    const cx = lx + ledge.width / 2;
+    const cy = sy - 25;
+    const progress = G.holdTimer / G.holdRequired;
+
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    // Progress arc
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+    ctx.strokeStyle = '#3fb950';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(cx, cy, 22, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+    ctx.strokeStyle = 'rgba(63,185,80,0.3)';
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
+    ctx.lineWidth = 1;
+  }
+
+  // Target zone indicator for next ledge
+  if (ledge.index === nextIdx && !ledge.reached) {
+    ctx.save();
+    ctx.globalAlpha = 0.4 + 0.2 * Math.sin(performance.now() / 300);
+    ctx.strokeStyle = '#58a6ff';
+    ctx.setLineDash([4, 4]);
+    ctx.strokeRect(lx - 2, sy - 2, ledge.width + 4, LEDGE_HEIGHT + 4);
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+}
+
+function drawPlayer() {
+  const px = CLIFF_WIDTH + LEDGE_WIDTH / 2 + G.windShake * Math.sin(performance.now() / 50) * 5;
+  const py = worldToScreen(G.playerY);
+
+  // Shadow/glow when climbing fast
+  if (G.pitch > 600) {
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.shadowColor = '#d2a8ff';
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = '#d2a8ff';
+    ctx.beginPath();
+    ctx.arc(px, py, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Body
+  ctx.fillStyle = '#e6edf3';
+  ctx.strokeStyle = '#e6edf3';
+  ctx.lineWidth = 2;
+
+  // Head
+  ctx.beginPath();
+  ctx.arc(px, py - 18, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Body line
+  ctx.beginPath();
+  ctx.moveTo(px, py - 12);
+  ctx.lineTo(px, py);
+  ctx.stroke();
+
+  // Arms (reaching up when climbing)
+  const armAngle = G.pitch > 200 ? -0.5 - (Math.min(G.pitch, 800) - 200) / 1200 : 0.3;
+  ctx.beginPath();
+  ctx.moveTo(px - 8, py - 8 + armAngle * 6);
+  ctx.lineTo(px, py - 10);
+  ctx.lineTo(px + 8, py - 8 + armAngle * 6);
+  ctx.stroke();
+
+  // Legs
+  const legSwing = Math.sin(performance.now() / 200) * 3;
+  ctx.beginPath();
+  ctx.moveTo(px - 5 + legSwing, py + 10);
+  ctx.lineTo(px, py);
+  ctx.lineTo(px + 5 - legSwing, py + 10);
+  ctx.stroke();
+
+  ctx.lineWidth = 1;
+}
+
+function drawBird(x, y, phase) {
+  ctx.strokeStyle = '#484f58';
+  ctx.lineWidth = 1.5;
+  const wingY = Math.sin(phase) * 6;
+  ctx.beginPath();
+  ctx.moveTo(x - 8, y + wingY);
+  ctx.quadraticCurveTo(x - 3, y - 4, x, y);
+  ctx.quadraticCurveTo(x + 3, y - 4, x + 8, y + wingY);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+function drawHUD() {
+  const w = canvas.width;
+
+  // Height
+  ctx.font = 'bold 16px Courier New';
+  ctx.fillStyle = '#e6edf3';
+  ctx.textAlign = 'left';
+  ctx.fillText(G.height.toFixed(1) + 'm', CLIFF_WIDTH + LEDGE_WIDTH + 20, 30);
+
+  // Level
+  ctx.font = '13px Courier New';
+  ctx.fillStyle = '#8b949e';
+  ctx.fillText('Level ' + (G.level + 1) + ' / 3', CLIFF_WIDTH + LEDGE_WIDTH + 20, 50);
+
+  // Ledge progress
+  const ledgesDone = G.ledges.filter(l => l.reached).length;
+  ctx.fillText('Ledges: ' + ledgesDone + ' / ' + G.ledges.length, CLIFF_WIDTH + LEDGE_WIDTH + 20, 68);
+
+  // Current pitch
+  if (G.smoothPitch > 0) {
+    const note = freqToNote(G.smoothPitch);
+    ctx.font = 'bold 14px Courier New';
+    ctx.fillStyle = '#58a6ff';
+    ctx.fillText(note + ' - ' + Math.round(G.smoothPitch) + 'Hz', CLIFF_WIDTH + LEDGE_WIDTH + 20, 92);
+  }
+
+  // Next target
+  const nextIdx = G.currentLedge + 1;
+  if (nextIdx < G.ledges.length) {
+    const ledge = G.ledges[nextIdx];
+    ctx.font = '12px Courier New';
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText('Target: ' + ledge.label, CLIFF_WIDTH + LEDGE_WIDTH + 20, 112);
+    ctx.fillText('Hold for ' + G.holdRequired.toFixed(1) + 's', CLIFF_WIDTH + LEDGE_WIDTH + 20, 128);
+  }
+}
+
+function drawPitchMeter() {
+  const w = canvas.width;
+  const h = canvas.height;
+  const meterX = w - 60;
+  const meterW = 30;
+  const meterH = h - 100;
+  const meterY = 50;
+
+  // Background
+  ctx.fillStyle = 'rgba(22,27,34,0.8)';
+  ctx.fillRect(meterX - 5, meterY - 5, meterW + 10, meterH + 10);
+
+  // Gradient zones
+  const zones = [
+    { min: 0, max: 0.067, color: '#f85149', label: '<100' },
+    { min: 0.067, max: 0.133, color: '#d29922', label: '100-200' },
+    { min: 0.133, max: 0.267, color: '#3fb950', label: '200-400' },
+    { min: 0.267, max: 0.4, color: '#58a6ff', label: '400-600' },
+    { min: 0.4, max: 0.667, color: '#bc8cff', label: '600-1000' },
+    { min: 0.667, max: 1, color: '#d2a8ff', label: '1000+' },
+  ];
+
+  for (const z of zones) {
+    const zy = meterY + meterH * (1 - z.max);
+    const zh = meterH * (z.max - z.min);
+    ctx.globalAlpha = 0.3;
+    ctx.fillStyle = z.color;
+    ctx.fillRect(meterX, zy, meterW, zh);
+  }
+  ctx.globalAlpha = 1;
+
+  // Target zone highlight for next ledge
+  const nextIdx = G.currentLedge + 1;
+  if (nextIdx < G.ledges.length) {
+    const ledge = G.ledges[nextIdx];
+    const tMin = (ledge.targetPitch - ledge.tolerance) / 1500;
+    const tMax = (ledge.targetPitch + ledge.tolerance) / 1500;
+    const ty = meterY + meterH * (1 - tMax);
+    const th = meterH * (tMax - tMin);
+    ctx.globalAlpha = 0.4 + 0.2 * Math.sin(performance.now() / 300);
+    ctx.fillStyle = '#3fb950';
+    ctx.fillRect(meterX - 3, ty, meterW + 6, th);
+    ctx.globalAlpha = 1;
+
+    ctx.font = '10px Courier New';
+    ctx.fillStyle = '#3fb950';
+    ctx.textAlign = 'right';
+    ctx.fillText(ledge.label, meterX - 6, ty + th / 2 + 4);
+  }
+
+  // Current pitch indicator
+  if (G.smoothPitch > 0) {
+    const pitchRatio = Math.min(1, G.smoothPitch / 1500);
+    const py = meterY + meterH * (1 - pitchRatio);
+
+    // Line
+    ctx.strokeStyle = '#e6edf3';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(meterX - 8, py);
+    ctx.lineTo(meterX + meterW + 8, py);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
+    // Dot
+    ctx.fillStyle = '#e6edf3';
+    ctx.beginPath();
+    ctx.arc(meterX + meterW / 2, py, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Border
+  ctx.strokeStyle = '#30363d';
+  ctx.strokeRect(meterX, meterY, meterW, meterH);
+
+  ctx.textAlign = 'left';
+}
+
+function drawWaveform() {
+  const w = canvas.width;
+  const h = canvas.height;
+  const wfH = 50;
+  const wfY = h - wfH - 10;
+  const wfX = CLIFF_WIDTH + LEDGE_WIDTH + 20;
+  const wfW = w - wfX - 80;
+
+  ctx.fillStyle = 'rgba(22,27,34,0.6)';
+  ctx.fillRect(wfX, wfY, wfW, wfH);
+
+  const wf = G.waveform;
+  const sliceWidth = wfW / wf.length;
+
+  // Determine color
+  let color = '#484f58';
+  const nextIdx = G.currentLedge + 1;
+  if (G.smoothPitch > 0 && nextIdx < G.ledges.length) {
+    const ledge = G.ledges[nextIdx];
+    color = pitchColor(G.smoothPitch, ledge.targetPitch, ledge.tolerance);
+  } else if (G.smoothPitch > 0) {
+    color = '#58a6ff';
+  }
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let x = wfX;
+  for (let i = 0; i < wf.length; i += 4) {
+    const v = wf[i];
+    const y = wfY + wfH / 2 + v * wfH * 0.4;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+    x += sliceWidth * 4;
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+// ============================================================
+// GAME FLOW
+// ============================================================
+function showScreen(id) {
+  screenTitle.classList.add('hidden');
+  screenCalibrate.classList.add('hidden');
+  screenGameover.classList.add('hidden');
+  document.getElementById(id).classList.remove('hidden');
+  overlay.classList.remove('hidden');
+}
+
+function showGameover(won) {
+  if (won) {
+    gameoverTitle.textContent = 'YOU DID IT!';
+    gameoverTitle.style.color = '#3fb950';
+    gameoverMsg.textContent = 'All ledges conquered. Your vocal cords deserve a medal.';
+  } else {
+    gameoverTitle.textContent = 'GAME OVER';
+    gameoverTitle.style.color = '#f85149';
+    gameoverMsg.textContent = 'You fell ' + G.height.toFixed(1) + ' meters. The cliff wins this round.';
+  }
+  gameoverScore.textContent = 'Score: ' + G.score;
+  showScreen('screen-gameover');
+}
+
+async function startCalibration() {
+  const ok = await initAudio();
+  if (!ok) {
+    micError.textContent = 'Microphone access denied or unavailable. This game needs your voice!';
+    micError.classList.remove('hidden');
+    return;
+  }
+  G.state = 'calibrate';
+  G.calDetections = 0;
+  showScreen('screen-calibrate');
+  calibrationLoop();
+}
+
+function calibrationLoop() {
+  if (G.state !== 'calibrate') return;
+  const p = detectPitch(analyser);
+  if (p > 0) {
+    const ratio = Math.min(1, p / 800);
+    calFill.style.width = (ratio * 100) + '%';
+    calFill.style.background = p > 400 ? '#d2a8ff' : p > 200 ? '#3fb950' : '#58a6ff';
+    pitchReadout.textContent = freqToNote(p) + ' - ' + Math.round(p) + 'Hz';
+    G.calDetections++;
+    if (G.calDetections > 15) {
+      calStatus.textContent = 'Mic is working. Ready when you are.';
+    }
+  } else {
+    calFill.style.width = '0%';
+    pitchReadout.textContent = 'Waiting for sound...';
+  }
+  requestAnimationFrame(calibrationLoop);
+}
+
+function startCountdown() {
+  G.state = 'countdown';
+  overlay.classList.add('hidden');
+  countdownEl.style.display = 'block';
+  resetGame();
+
+  let count = 3;
+  countdownEl.textContent = count;
+  playTone(330, 0.15, 'sine', 0.1);
+
+  const interval = setInterval(() => {
+    count--;
+    if (count > 0) {
+      countdownEl.textContent = count;
+      playTone(330, 0.15, 'sine', 0.1);
+    } else {
+      countdownEl.textContent = 'GO!';
+      playTone(660, 0.3, 'sine', 0.12);
+      setTimeout(() => {
+        countdownEl.style.display = 'none';
+        G.state = 'playing';
+        G.startTime = performance.now();
+      }, 500);
+      clearInterval(interval);
+    }
+  }, 1000);
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+function gameLoop(timestamp) {
+  const dt = Math.min(0.05, (timestamp - G.lastFrame) / 1000);
+  G.lastFrame = timestamp;
+
+  resize();
+  update(dt);
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// Event listeners
+btnStart.addEventListener('click', startCalibration);
+btnPlay.addEventListener('click', startCountdown);
+btnRetry.addEventListener('click', startCountdown);
+
+// Init
+resize();
+generateStars();
+generateLedges();
+G.lastFrame = performance.now();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
