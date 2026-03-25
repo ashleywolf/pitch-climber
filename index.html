@@ -57,6 +57,53 @@ canvas { display: block; }
   transition: opacity 0.5s;
 }
 #high-scores { margin-top: 0.8rem; font-size: 0.85rem; color: #8b949e; }
+.gh-username-row {
+  display: flex; align-items: center; gap: 8px; margin-top: 1rem; justify-content: center;
+}
+.gh-username-input {
+  width: 200px; padding: 6px 10px; font-size: 0.9rem; font-family: inherit;
+  background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px;
+  outline: none;
+}
+.gh-username-input:focus { border-color: #58a6ff; }
+.gh-avatar-preview {
+  width: 32px; height: 32px; border-radius: 50%; background: #21262d;
+  border: 1px solid #30363d; object-fit: cover;
+}
+.lb-container {
+  margin-top: 1rem; border: 1px solid #c9930a; border-radius: 8px;
+  padding: 10px 14px; background: rgba(201, 147, 10, 0.06); max-width: 520px;
+}
+.lb-container h3 { font-size: 1rem; color: #e3b341; margin-bottom: 8px; }
+.lb-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.lb-table th {
+  color: #8b949e; font-weight: normal; text-align: left; padding: 3px 6px;
+  border-bottom: 1px solid #30363d;
+}
+.lb-table td { padding: 4px 6px; color: #c9d1d9; white-space: nowrap; }
+.lb-table tr.lb-current td { color: #e3b341; font-weight: bold; }
+.lb-avatar {
+  width: 24px; height: 24px; border-radius: 50%; vertical-align: middle;
+  background: #21262d; border: 1px solid #30363d;
+}
+.lb-anon-circle {
+  display: inline-block; width: 24px; height: 24px; border-radius: 50%;
+  background: #30363d; vertical-align: middle;
+}
+.lb-diff-badge {
+  display: inline-block; font-size: 0.65rem; padding: 1px 5px; border-radius: 3px;
+  font-weight: bold; text-transform: uppercase;
+}
+.lb-diff-easy { background: #238636; color: #fff; }
+.lb-diff-normal { background: #1f6feb; color: #fff; }
+.lb-diff-hard { background: #da3633; color: #fff; }
+.lb-save-btn {
+  margin-top: 0.8rem; padding: 8px 20px; font-size: 0.95rem; font-family: inherit;
+  background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer;
+}
+.lb-save-btn:hover { background: #2ea043; }
+.lb-save-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
+.lb-save-msg { font-size: 0.8rem; color: #8b949e; margin-top: 0.4rem; }
 .hidden { display: none !important; }
 </style>
 </head>
@@ -67,9 +114,14 @@ canvas { display: block; }
     <h1>PITCH CLIMBER</h1>
     <p>Sing the right notes to climb the cliff. Hold each ledge to progress.</p>
     <p>Multiple difficulty levels. Dignity still optional.</p>
+    <div class="gh-username-row">
+      <img id="title-avatar-preview" class="gh-avatar-preview" style="display:none;" alt="">
+      <input id="gh-username" class="gh-username-input" type="text" placeholder="Your GitHub username" autocomplete="off" spellcheck="false">
+    </div>
     <button id="btn-start">Start Microphone</button>
     <p id="mic-error" class="hidden" style="color:#f85149;margin-top:1rem;"></p>
     <div id="high-scores"></div>
+    <div id="title-leaderboard"></div>
   </div>
   <div id="screen-calibrate" class="hidden">
     <h2>Microphone Calibration</h2>
@@ -110,6 +162,8 @@ canvas { display: block; }
     <p id="gameover-msg"></p>
     <p id="gameover-score" style="font-size:1.4rem;color:#58a6ff;margin-top:0.5rem;"></p>
     <button id="btn-retry">Try Again</button>
+    <div id="lb-save-area"></div>
+    <div id="gameover-leaderboard"></div>
   </div>
 </div>
 <div id="countdown"></div>
@@ -147,6 +201,11 @@ const warmupStatus = document.getElementById('warmup-status');
 const rangeSummary = document.getElementById('range-summary');
 const fadeOverlay = document.getElementById('fade-overlay');
 const highScoresDiv = document.getElementById('high-scores');
+const ghUsernameInput = document.getElementById('gh-username');
+const titleAvatarPreview = document.getElementById('title-avatar-preview');
+const titleLeaderboard = document.getElementById('title-leaderboard');
+const gameoverLeaderboard = document.getElementById('gameover-leaderboard');
+const lbSaveArea = document.getElementById('lb-save-area');
 
 // Audio
 let audioCtx, analyser, micStream;
@@ -1274,6 +1333,10 @@ function showGameover(won) {
   const hsText = hs ? ' | Best: ' + hs.score : '';
   gameoverScore.textContent = 'Score: ' + G.score + hsText;
   stopWindAudio();
+  currentScoreId = null;
+  scoreSaved = false;
+  renderSaveArea();
+  renderGameoverLeaderboard(null);
   showScreen('screen-gameover');
 }
 
@@ -1439,6 +1502,147 @@ function startCountdown() {
 }
 
 // ============================================================
+// LEADERBOARD
+// ============================================================
+
+function getGitHubUsername() {
+  return (ghUsernameInput.value || '').trim();
+}
+
+function loadLeaderboard() {
+  try {
+    const raw = localStorage.getItem('pitchClimber_leaderboard');
+    if (raw) return JSON.parse(raw);
+  } catch(e) {}
+  return [];
+}
+
+function saveLeaderboard(board) {
+  try { localStorage.setItem('pitchClimber_leaderboard', JSON.stringify(board)); } catch(e) {}
+}
+
+function scoreQualifies(score, board) {
+  if (board.length < 10) return true;
+  return score > board[board.length - 1].score;
+}
+
+function addToLeaderboard(entry) {
+  const board = loadLeaderboard();
+  board.push(entry);
+  board.sort((a, b) => b.score - a.score);
+  const trimmed = board.slice(0, 10);
+  saveLeaderboard(trimmed);
+  return trimmed;
+}
+
+function formatDate(iso) {
+  const d = new Date(iso);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[d.getMonth()] + ' ' + d.getDate();
+}
+
+function avatarHTML(username, size) {
+  if (!username) return '<span class="lb-anon-circle"></span>';
+  return '<img class="lb-avatar" width="' + size + '" height="' + size + '" src="https://github.com/' +
+    username + '.png?size=48" onerror="this.style.display=\'none\';this.insertAdjacentHTML(\'afterend\',\'<span class=lb-anon-circle></span>\')" alt="">';
+}
+
+function diffBadge(diff) {
+  return '<span class="lb-diff-badge lb-diff-' + diff + '">' + diff + '</span>';
+}
+
+function renderLeaderboardTable(board, limit, currentId) {
+  if (!board.length) return '';
+  const rows = board.slice(0, limit);
+  let html = '<table class="lb-table"><tr><th>#</th><th></th><th>Player</th><th>Height</th><th>Diff</th><th>Date</th></tr>';
+  rows.forEach((e, i) => {
+    const cls = e.id === currentId ? ' class="lb-current"' : '';
+    const name = e.username || 'Anonymous';
+    html += '<tr' + cls + '><td>' + (i + 1) + '</td><td>' + avatarHTML(e.username, 24) +
+      '</td><td>' + name + '</td><td>' + e.score + '</td><td>' + diffBadge(e.difficulty) +
+      '</td><td>' + formatDate(e.date) + '</td></tr>';
+  });
+  html += '</table>';
+  return html;
+}
+
+function renderTitleLeaderboard() {
+  const board = loadLeaderboard();
+  if (!board.length) { titleLeaderboard.innerHTML = ''; return; }
+  titleLeaderboard.innerHTML = '<div class="lb-container"><h3>\u{1F3C6} LEADERBOARD</h3>' +
+    renderLeaderboardTable(board, 5) + '</div>';
+}
+
+function renderGameoverLeaderboard(currentId) {
+  const board = loadLeaderboard();
+  if (!board.length) { gameoverLeaderboard.innerHTML = ''; return; }
+  gameoverLeaderboard.innerHTML = '<div class="lb-container" style="margin-top:1.2rem;"><h3>\u{1F3C6} LEADERBOARD</h3>' +
+    renderLeaderboardTable(board, 10, currentId) + '</div>';
+}
+
+let currentScoreId = null;
+let scoreSaved = false;
+
+function renderSaveArea() {
+  const username = getGitHubUsername();
+  const board = loadLeaderboard();
+  const qualifies = scoreQualifies(G.score, board);
+
+  if (scoreSaved) {
+    lbSaveArea.innerHTML = '<p class="lb-save-msg" style="color:#3fb950;margin-top:0.8rem;">\u2713 Saved!</p>';
+    return;
+  }
+  if (!qualifies) {
+    lbSaveArea.innerHTML = '';
+    return;
+  }
+  if (!username) {
+    lbSaveArea.innerHTML = '<p class="lb-save-msg" style="margin-top:0.8rem;">Enter username on title screen to save score</p>';
+    return;
+  }
+  lbSaveArea.innerHTML = '<button class="lb-save-btn" id="btn-save-score">Save to Leaderboard</button>';
+  document.getElementById('btn-save-score').addEventListener('click', function() {
+    currentScoreId = 'lb_' + Date.now();
+    const entry = {
+      username: username,
+      avatar: 'https://github.com/' + username + '.png?size=48',
+      score: G.score,
+      difficulty: G.difficulty,
+      date: new Date().toISOString(),
+      id: currentScoreId
+    };
+    addToLeaderboard(entry);
+    scoreSaved = true;
+    renderSaveArea();
+    renderGameoverLeaderboard(currentScoreId);
+    renderTitleLeaderboard();
+  });
+}
+
+// GitHub username persistence
+(function initUsername() {
+  const stored = localStorage.getItem('github_username') || '';
+  ghUsernameInput.value = stored;
+  if (stored) {
+    titleAvatarPreview.src = 'https://github.com/' + stored + '.png?size=40';
+    titleAvatarPreview.style.display = '';
+  }
+})();
+
+let avatarDebounce = null;
+ghUsernameInput.addEventListener('input', function() {
+  const val = this.value.trim();
+  localStorage.setItem('github_username', val);
+  clearTimeout(avatarDebounce);
+  if (!val) { titleAvatarPreview.style.display = 'none'; return; }
+  avatarDebounce = setTimeout(function() {
+    titleAvatarPreview.src = 'https://github.com/' + val + '.png?size=40';
+    titleAvatarPreview.style.display = '';
+  }, 400);
+});
+titleAvatarPreview.addEventListener('error', function() { this.style.display = 'none'; });
+
+// ============================================================
 // MAIN LOOP
 // ============================================================
 function gameLoop(timestamp) {
@@ -1465,6 +1669,7 @@ generateLedges();
 G.lastFrame = performance.now();
 requestAnimationFrame(gameLoop);
 displayHighScores();
+renderTitleLeaderboard();
 </script>
 </body>
 </html>
