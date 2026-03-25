@@ -36,6 +36,27 @@ canvas { display: block; }
   font-size: 8rem; color: #58a6ff; z-index: 20; display: none;
   text-shadow: 0 0 40px rgba(88,166,255,0.5);
 }
+.diff-buttons { display: flex; gap: 12px; margin-top: 1.2rem; flex-wrap: wrap; justify-content: center; }
+.diff-btn {
+  padding: 12px 24px; font-size: 1rem; border-radius: 6px; cursor: pointer;
+  font-family: inherit; border: 2px solid #30363d; background: #161b22; color: #e6edf3;
+  transition: border-color 0.2s, background 0.2s;
+}
+.diff-btn:hover { border-color: #58a6ff; background: #1c2128; }
+.diff-btn.recommended { border-color: #3fb950; }
+.diff-btn .diff-label { font-weight: bold; display: block; margin-bottom: 4px; }
+.diff-btn .diff-detail { font-size: 0.75rem; color: #8b949e; }
+#warmup-bar {
+  width: 300px; height: 20px; background: #161b22; border: 1px solid #30363d;
+  border-radius: 4px; margin: 0.8rem 0; overflow: hidden;
+}
+#warmup-fill { height: 100%; background: #58a6ff; width: 0%; transition: width 0.1s linear; }
+#fade-overlay {
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: #0d1117; z-index: 15; pointer-events: none; opacity: 0;
+  transition: opacity 0.5s;
+}
+#high-scores { margin-top: 0.8rem; font-size: 0.85rem; color: #8b949e; }
 .hidden { display: none !important; }
 </style>
 </head>
@@ -44,11 +65,11 @@ canvas { display: block; }
 <div id="overlay">
   <div id="screen-title">
     <h1>PITCH CLIMBER</h1>
-    <h2>Use your voice to climb!</h2>
-    <p>Sing higher to climb. Hold target notes on ledges to checkpoint.</p>
-    <p>Warning: falsetto will be required. Dignity is optional.</p>
+    <p>Sing the right notes to climb the cliff. Hold each ledge to progress.</p>
+    <p>Multiple difficulty levels. Dignity still optional.</p>
     <button id="btn-start">Start Microphone</button>
     <p id="mic-error" class="hidden" style="color:#f85149;margin-top:1rem;"></p>
+    <div id="high-scores"></div>
   </div>
   <div id="screen-calibrate" class="hidden">
     <h2>Microphone Calibration</h2>
@@ -58,6 +79,32 @@ canvas { display: block; }
     <p id="cal-status" style="color:#3fb950;min-height:1.5rem;"></p>
     <button id="btn-play">Ready to Climb!</button>
   </div>
+  <div id="screen-warmup" class="hidden">
+    <h2>Sing Your Range</h2>
+    <p>Sing from your lowest to highest note. 5 seconds.</p>
+    <div id="warmup-bar"><div id="warmup-fill"></div></div>
+    <div id="warmup-range" style="font-size:1.4rem;color:#58a6ff;min-height:2rem;">Listening...</div>
+    <p id="warmup-status" style="color:#8b949e;min-height:1.5rem;"></p>
+  </div>
+  <div id="screen-difficulty" class="hidden">
+    <h2>Choose Difficulty</h2>
+    <p id="range-summary" style="margin-bottom:0.5rem;"></p>
+    <div class="diff-buttons">
+      <button class="diff-btn" data-diff="easy">
+        <span class="diff-label">Easy</span>
+        <span class="diff-detail">100-350Hz / +/-75Hz / 2 levels</span>
+      </button>
+      <button class="diff-btn" data-diff="normal">
+        <span class="diff-label">Normal</span>
+        <span class="diff-detail">200-700Hz / +/-30-50Hz / 3 levels</span>
+      </button>
+      <button class="diff-btn" data-diff="hard">
+        <span class="diff-label">Hard</span>
+        <span class="diff-detail">300-1000Hz / +/-15Hz / 3 levels</span>
+      </button>
+    </div>
+    <p style="margin-top:1rem;font-size:0.85rem;color:#484f58;">Or press 1, 2, 3</p>
+  </div>
   <div id="screen-gameover" class="hidden">
     <h1 id="gameover-title">GAME OVER</h1>
     <p id="gameover-msg"></p>
@@ -66,6 +113,7 @@ canvas { display: block; }
   </div>
 </div>
 <div id="countdown"></div>
+<div id="fade-overlay"></div>
 
 <script>
 // ============================================================
@@ -91,9 +139,45 @@ const countdownEl = document.getElementById('countdown');
 const gameoverTitle = document.getElementById('gameover-title');
 const gameoverMsg = document.getElementById('gameover-msg');
 const gameoverScore = document.getElementById('gameover-score');
+const screenWarmup = document.getElementById('screen-warmup');
+const screenDifficulty = document.getElementById('screen-difficulty');
+const warmupFill = document.getElementById('warmup-fill');
+const warmupRange = document.getElementById('warmup-range');
+const warmupStatus = document.getElementById('warmup-status');
+const rangeSummary = document.getElementById('range-summary');
+const fadeOverlay = document.getElementById('fade-overlay');
+const highScoresDiv = document.getElementById('high-scores');
 
 // Audio
 let audioCtx, analyser, micStream;
+let windNoiseSource, windGain;
+
+// Difficulty presets
+const DIFFICULTIES = {
+  easy: {
+    levels: [
+      { minPitch: 100, maxPitch: 200, tolerance: 75, count: 5, label: 'Level 1 - Low Rumble' },
+      { minPitch: 180, maxPitch: 350, tolerance: 75, count: 5, label: 'Level 2 - Low Voice' },
+    ],
+    totalLevels: 2,
+  },
+  normal: {
+    levels: [
+      { minPitch: 200, maxPitch: 400, tolerance: 50, count: 5, label: 'Level 1 - Low Notes' },
+      { minPitch: 300, maxPitch: 590, tolerance: 30, count: 5, label: 'Level 2 - Mid Notes' },
+      { minPitch: 440, maxPitch: 850, tolerance: 25, count: 5, label: 'Level 3 - High Notes' },
+    ],
+    totalLevels: 3,
+  },
+  hard: {
+    levels: [
+      { minPitch: 300, maxPitch: 550, tolerance: 15, count: 5, label: 'Level 1 - Precision Low' },
+      { minPitch: 500, maxPitch: 780, tolerance: 15, count: 5, label: 'Level 2 - Precision Mid' },
+      { minPitch: 700, maxPitch: 1000, tolerance: 15, count: 5, label: 'Level 3 - Precision High' },
+    ],
+    totalLevels: 3,
+  },
+};
 
 // Game state
 const G = {
@@ -120,6 +204,15 @@ const G = {
   waveform: new Float32Array(2048),
   lastFrame: 0,
   calDetections: 0,
+  difficulty: 'normal',
+  velocity: 0,
+  warmupMin: Infinity,
+  warmupMax: 0,
+  deathPhase: 0,
+  deathTimer: 0,
+  deathPlayerY: 0,
+  deathRotation: 0,
+  deathBirdsScattered: false,
 };
 
 // Constants
@@ -280,6 +373,40 @@ function playCrash() {
   src.start();
 }
 
+function startWindAudio() {
+  if (!audioCtx || windNoiseSource) return;
+  const bufSize = audioCtx.sampleRate * 2;
+  const noiseBuf = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
+  const data = noiseBuf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+  windNoiseSource = audioCtx.createBufferSource();
+  windNoiseSource.buffer = noiseBuf;
+  windNoiseSource.loop = true;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 400;
+  windGain = audioCtx.createGain();
+  windGain.gain.value = 0.02;
+  windNoiseSource.connect(filter);
+  filter.connect(windGain);
+  windGain.connect(audioCtx.destination);
+  windNoiseSource.start();
+}
+
+function updateWindAudio() {
+  if (!windGain || G.state !== 'playing') return;
+  const altRatio = Math.min(1, G.playerY / (LEVEL_HEIGHT * 3));
+  windGain.gain.value = 0.02 + altRatio * 0.04;
+}
+
+function stopWindAudio() {
+  if (windNoiseSource) {
+    try { windNoiseSource.stop(); } catch(e) {}
+    windNoiseSource = null;
+    windGain = null;
+  }
+}
+
 // ============================================================
 // LEVEL GENERATION
 // ============================================================
@@ -315,7 +442,7 @@ function generateStars() {
   for (let i = 0; i < 200; i++) {
     G.stars.push({
       x: Math.random(),
-      y: Math.random() * LEVEL_HEIGHT * 3.5,
+      y: Math.random() * LEVEL_HEIGHT * (DIFFICULTIES[G.difficulty].totalLevels + 0.5),
       size: Math.random() * 2 + 0.5,
       twinkle: Math.random() * Math.PI * 2,
     });
@@ -385,6 +512,10 @@ function resetGame() {
   G.windShake = 0;
   G.pitch = -1;
   G.smoothPitch = -1;
+  G.velocity = 0;
+  G.deathPhase = 0;
+  G.deathTimer = 0;
+  G.deathRotation = 0;
   generateLedges();
   generateStars();
   G.startTime = performance.now();
@@ -411,9 +542,20 @@ function update(dt) {
     G.smoothPitch = -1;
   }
 
-  // Climb speed
-  const speed = pitchToClimbSpeed(G.pitch);
-  G.targetY += speed * dt;
+  // Climb speed with momentum
+  if (G.pitch > 0) {
+    const speed = pitchToClimbSpeed(G.pitch);
+    G.velocity = speed;
+  } else {
+    // Coast upward briefly, then gravity
+    if (G.velocity > 0) {
+      G.velocity *= 0.95;
+      if (G.velocity < 5) G.velocity = -GRAVITY;
+    } else {
+      G.velocity = -GRAVITY;
+    }
+  }
+  G.targetY += G.velocity * dt;
   if (G.targetY < 0) G.targetY = 0;
 
   // Lerp player to target
@@ -428,7 +570,8 @@ function update(dt) {
   if (G.cameraY < 0) G.cameraY = 0;
 
   // Current level
-  G.level = Math.min(2, Math.floor(G.playerY / LEVEL_HEIGHT));
+  const diff = DIFFICULTIES[G.difficulty];
+  G.level = Math.min(diff.totalLevels - 1, Math.floor(G.playerY / LEVEL_HEIGHT));
 
   // Ledge checking
   const nextLedgeIdx = G.currentLedge + 1;
@@ -469,6 +612,7 @@ function update(dt) {
             const timeBonus = Math.max(0, Math.round(3000 - elapsed * 5));
             G.score = Math.round(G.height * 10) + timeBonus;
             playFanfare();
+            stopWindAudio();
             showGameover(true);
             return;
           }
@@ -542,13 +686,69 @@ function update(dt) {
   }
   G.windShake *= (1 - dt * 2);
 
-  // Game over check
+  // Game over check - start death sequence
   if (G.playerY < G.cameraY - 100 && G.cameraY > 100) {
-    G.state = 'gameover';
-    playCrash();
+    G.state = 'dying';
+    G.deathPhase = 0;
+    G.deathTimer = 0;
+    G.deathPlayerY = G.playerY;
+    G.deathRotation = 0;
+    G.deathBirdsScattered = false;
+    G.velocity = 0;
+    playFall();
     const elapsed = (performance.now() - G.startTime) / 1000;
     G.score = Math.round(G.height * 10);
+  }
+}
+
+function updateDeathSequence(dt) {
+  if (G.state !== 'dying') return;
+  G.deathTimer += dt;
+  G.deathPlayerY -= 300 * dt; // falling fast
+  G.deathRotation += dt * 8;
+
+  // Scatter birds away from falling player
+  if (!G.deathBirdsScattered) {
+    G.deathBirdsScattered = true;
+    for (const b of G.birds) {
+      b.speed = 200 + Math.random() * 150;
+      b.y += (Math.random() - 0.5) * 100;
+    }
+    // Spawn extra panicked birds
+    for (let i = 0; i < 5; i++) {
+      G.birds.push({
+        x: CLIFF_WIDTH + LEDGE_WIDTH / 2 + (Math.random() - 0.5) * 100,
+        y: G.deathPlayerY + (Math.random() - 0.5) * 80,
+        speed: 150 + Math.random() * 200,
+        wingPhase: Math.random() * Math.PI * 2,
+      });
+    }
+  }
+
+  // Camera follows falling player briefly
+  if (G.deathTimer < 1.2) {
+    const targetCam = G.deathPlayerY - canvas.height * 0.4;
+    G.cameraY += (targetCam - G.cameraY) * 3 * dt;
+  }
+
+  // Update birds during death
+  for (let i = G.birds.length - 1; i >= 0; i--) {
+    const b = G.birds[i];
+    b.x -= b.speed * dt;
+    b.wingPhase += dt * 12;
+    if (b.x < -40) G.birds.splice(i, 1);
+  }
+
+  // Fade to game over after 1.5 seconds
+  if (G.deathTimer > 1.0) {
+    fadeOverlay.style.opacity = Math.min(1, (G.deathTimer - 1.0) / 0.5);
+  }
+  if (G.deathTimer > 1.8) {
+    G.state = 'gameover';
+    playCrash();
+    saveHighScore();
     showGameover(false);
+    setTimeout(() => { fadeOverlay.style.opacity = 0; }, 100);
   }
 }
 
@@ -565,7 +765,8 @@ function render() {
   ctx.clearRect(0, 0, w, h);
 
   // Background gradient based on altitude
-  const altRatio = Math.min(1, G.cameraY / (LEVEL_HEIGHT * 3));
+  const totalLevels = DIFFICULTIES[G.difficulty].totalLevels;
+  const altRatio = Math.min(1, G.cameraY / (LEVEL_HEIGHT * totalLevels));
   const r = Math.round(13 + altRatio * 20);
   const g = Math.round(17 - altRatio * 5);
   const b = Math.round(23 + altRatio * 60);
@@ -640,8 +841,11 @@ function render() {
   ctx.globalAlpha = 1;
 
   // Player character
-  if (G.state === 'playing' || G.state === 'gameover' || G.state === 'win') {
+  if (G.state === 'playing' || G.state === 'win') {
     drawPlayer();
+  }
+  if (G.state === 'dying') {
+    drawFallingPlayer();
   }
 
   // HUD
@@ -649,6 +853,9 @@ function render() {
     drawHUD();
     drawWaveform();
     drawPitchMeter();
+  }
+  if (G.state === 'dying') {
+    drawHUD();
   }
 }
 
@@ -795,6 +1002,47 @@ function drawPlayer() {
   ctx.lineWidth = 1;
 }
 
+function drawFallingPlayer() {
+  const px = CLIFF_WIDTH + LEDGE_WIDTH / 2;
+  const py = worldToScreen(G.deathPlayerY);
+
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(G.deathRotation);
+
+  // Body (same stick figure, but rotated)
+  ctx.fillStyle = '#f85149';
+  ctx.strokeStyle = '#f85149';
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+  ctx.arc(0, -18, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(0, -12);
+  ctx.lineTo(0, 0);
+  ctx.stroke();
+
+  // Arms flailing
+  const flail = Math.sin(performance.now() / 80) * 0.8;
+  ctx.beginPath();
+  ctx.moveTo(-8, -8 + Math.sin(flail) * 4);
+  ctx.lineTo(0, -10);
+  ctx.lineTo(8, -8 + Math.cos(flail) * 4);
+  ctx.stroke();
+
+  // Legs flailing
+  ctx.beginPath();
+  ctx.moveTo(-5 + Math.sin(flail * 1.3) * 4, 10);
+  ctx.lineTo(0, 0);
+  ctx.lineTo(5 + Math.cos(flail * 1.3) * 4, 10);
+  ctx.stroke();
+
+  ctx.lineWidth = 1;
+  ctx.restore();
+}
+
 function drawBird(x, y, phase) {
   ctx.strokeStyle = '#484f58';
   ctx.lineWidth = 1.5;
@@ -819,7 +1067,8 @@ function drawHUD() {
   // Level
   ctx.font = '13px Courier New';
   ctx.fillStyle = '#8b949e';
-  ctx.fillText('Level ' + (G.level + 1) + ' / 3', CLIFF_WIDTH + LEDGE_WIDTH + 20, 50);
+  const totalLvls = DIFFICULTIES[G.difficulty].totalLevels;
+  ctx.fillText('Level ' + (G.level + 1) + ' / ' + totalLvls, CLIFF_WIDTH + LEDGE_WIDTH + 20, 50);
 
   // Ledge progress
   const ledgesDone = G.ledges.filter(l => l.reached).length;
@@ -959,6 +1208,42 @@ function drawWaveform() {
   }
   ctx.stroke();
   ctx.lineWidth = 1;
+
+  // Target frequency line on waveform
+  const nextLedgeIdx = G.currentLedge + 1;
+  if (nextLedgeIdx < G.ledges.length) {
+    const ledge = G.ledges[nextLedgeIdx];
+    // Map target pitch to a y position on the waveform (higher pitch = higher on display)
+    const normalizedTarget = Math.min(1, Math.max(0, (ledge.targetPitch - 80) / 1200));
+    const targetLineY = wfY + wfH - normalizedTarget * wfH;
+
+    let lineColor = '#f85149'; // red = far
+    if (G.smoothPitch > 0) {
+      const diff = Math.abs(G.smoothPitch - ledge.targetPitch);
+      if (diff <= ledge.tolerance) lineColor = '#3fb950';
+      else if (diff <= ledge.tolerance * 2) lineColor = '#d29922';
+    }
+
+    ctx.save();
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.globalAlpha = 0.7;
+    ctx.beginPath();
+    ctx.moveTo(wfX, targetLineY);
+    ctx.lineTo(wfX + wfW, targetLineY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Label the target line
+    ctx.font = '10px Courier New';
+    ctx.fillStyle = lineColor;
+    ctx.globalAlpha = 0.9;
+    ctx.textAlign = 'right';
+    ctx.fillText(ledge.label, wfX + wfW - 4, targetLineY - 4);
+    ctx.textAlign = 'left';
+    ctx.restore();
+  }
 }
 
 // ============================================================
@@ -968,6 +1253,8 @@ function showScreen(id) {
   screenTitle.classList.add('hidden');
   screenCalibrate.classList.add('hidden');
   screenGameover.classList.add('hidden');
+  screenWarmup.classList.add('hidden');
+  screenDifficulty.classList.add('hidden');
   document.getElementById(id).classList.remove('hidden');
   overlay.classList.remove('hidden');
 }
@@ -977,12 +1264,16 @@ function showGameover(won) {
     gameoverTitle.textContent = 'YOU DID IT!';
     gameoverTitle.style.color = '#3fb950';
     gameoverMsg.textContent = 'All ledges conquered. Your vocal cords deserve a medal.';
+    saveHighScore();
   } else {
     gameoverTitle.textContent = 'GAME OVER';
     gameoverTitle.style.color = '#f85149';
     gameoverMsg.textContent = 'You fell ' + G.height.toFixed(1) + ' meters. The cliff wins this round.';
   }
-  gameoverScore.textContent = 'Score: ' + G.score;
+  const hs = loadHighScore(G.difficulty);
+  const hsText = hs ? ' | Best: ' + hs.score : '';
+  gameoverScore.textContent = 'Score: ' + G.score + hsText;
+  stopWindAudio();
   showScreen('screen-gameover');
 }
 
@@ -1018,11 +1309,112 @@ function calibrationLoop() {
   requestAnimationFrame(calibrationLoop);
 }
 
+function startWarmup() {
+  G.state = 'warmup';
+  G.warmupMin = Infinity;
+  G.warmupMax = 0;
+  showScreen('screen-warmup');
+  let elapsed = 0;
+  const duration = 5;
+
+  function warmupTick() {
+    if (G.state !== 'warmup') return;
+    elapsed += 0.05;
+    warmupFill.style.width = Math.min(100, (elapsed / duration) * 100) + '%';
+
+    const p = detectPitch(analyser);
+    if (p > 0) {
+      if (p < G.warmupMin) G.warmupMin = p;
+      if (p > G.warmupMax) G.warmupMax = p;
+      warmupRange.textContent = Math.round(G.warmupMin) + 'Hz - ' + Math.round(G.warmupMax) + 'Hz';
+    }
+
+    if (elapsed >= duration) {
+      if (G.warmupMax === 0) {
+        warmupStatus.textContent = 'No pitch detected. Try again or pick a difficulty.';
+      }
+      setTimeout(() => showDifficultySelect(), 600);
+      return;
+    }
+    setTimeout(warmupTick, 50);
+  }
+  warmupTick();
+}
+
+function showDifficultySelect() {
+  G.state = 'difficulty';
+  showScreen('screen-difficulty');
+
+  // Recommend based on detected range
+  let recommended = 'normal';
+  if (G.warmupMax > 0 && G.warmupMax < 400) recommended = 'easy';
+  else if (G.warmupMax > 700) recommended = 'hard';
+
+  const rangeText = G.warmupMax > 0
+    ? 'Your range: ' + Math.round(G.warmupMin) + 'Hz - ' + Math.round(G.warmupMax) + 'Hz'
+    : 'No range detected';
+  rangeSummary.textContent = rangeText;
+
+  // Highlight recommended
+  document.querySelectorAll('.diff-btn').forEach(btn => {
+    btn.classList.remove('recommended');
+    if (btn.dataset.diff === recommended) btn.classList.add('recommended');
+  });
+}
+
+function selectDifficulty(diff) {
+  G.difficulty = diff;
+  startCountdown();
+}
+
+// Difficulty button clicks
+document.querySelectorAll('.diff-btn').forEach(btn => {
+  btn.addEventListener('click', () => selectDifficulty(btn.dataset.diff));
+});
+
+// Keyboard 1/2/3 for difficulty
+document.addEventListener('keydown', (e) => {
+  if (G.state !== 'difficulty') return;
+  if (e.key === '1') selectDifficulty('easy');
+  if (e.key === '2') selectDifficulty('normal');
+  if (e.key === '3') selectDifficulty('hard');
+});
+
+function loadHighScore(diff) {
+  try {
+    const raw = localStorage.getItem('pitchClimber_highScore_' + diff);
+    if (raw) return JSON.parse(raw);
+  } catch(e) {}
+  return null;
+}
+
+function saveHighScore() {
+  const key = 'pitchClimber_highScore_' + G.difficulty;
+  const existing = loadHighScore(G.difficulty);
+  const newScore = { height: G.height, level: G.level + 1, score: G.score };
+  if (!existing || G.score > existing.score) {
+    try { localStorage.setItem(key, JSON.stringify(newScore)); } catch(e) {}
+  }
+}
+
+function displayHighScores() {
+  let html = '';
+  for (const diff of ['easy', 'normal', 'hard']) {
+    const hs = loadHighScore(diff);
+    if (hs) {
+      html += diff.charAt(0).toUpperCase() + diff.slice(1) + ': ' +
+        hs.height.toFixed(1) + 'm / Lv' + hs.level + ' (' + hs.score + 'pts)<br>';
+    }
+  }
+  highScoresDiv.innerHTML = html || '';
+}
+
 function startCountdown() {
   G.state = 'countdown';
   overlay.classList.add('hidden');
   countdownEl.style.display = 'block';
   resetGame();
+  startWindAudio();
 
   let count = 3;
   countdownEl.textContent = count;
@@ -1055,14 +1447,16 @@ function gameLoop(timestamp) {
 
   resize();
   update(dt);
+  updateDeathSequence(dt);
+  updateWindAudio();
   render();
   requestAnimationFrame(gameLoop);
 }
 
 // Event listeners
 btnStart.addEventListener('click', startCalibration);
-btnPlay.addEventListener('click', startCountdown);
-btnRetry.addEventListener('click', startCountdown);
+btnPlay.addEventListener('click', startWarmup);
+btnRetry.addEventListener('click', () => showDifficultySelect());
 
 // Init
 resize();
@@ -1070,6 +1464,7 @@ generateStars();
 generateLedges();
 G.lastFrame = performance.now();
 requestAnimationFrame(gameLoop);
+displayHighScores();
 </script>
 </body>
 </html>
